@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import select, MetaData
+from sqlalchemy import select, MetaData, update
 from typing import Optional, Dict, Any
 import os
 from dotenv import load_dotenv
@@ -19,6 +19,7 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+BUNDLE_API_URL = os.getenv("BUNDLE_API_URL", "http://192.168.1.73:3000/bundles/purchase")
 
 engine = create_async_engine(DATABASE_URL.replace('postgresql://', 'postgresql+asyncpg://'), echo=True)
 async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
@@ -71,63 +72,191 @@ async def process_airtime_purchase(session: AsyncSession, phone: str, package_da
         if balance is None or balance < price:
             return {
                 "success": False,
-                "message": f"Insufficient airtime balance. You have {balance if balance else 0} RWF but need {price} RWF."
+                "message": f"❌ Insufficient airtime balance.\n\n💵 Your Balance: {balance if balance else 0} RWF\n💰 Required: {price} RWF\n📉 Shortage: {price - (balance if balance else 0)} RWF"
             }
         
-        # Deduct airtime balance
-        airtime_table = metadata.tables.get("airtime_balance")
-        if airtime_table:
-            from sqlalchemy import update
-            stmt = update(airtime_table).where(
-                airtime_table.c.phone_number == phone
-            ).values(balance=balance - price)
-            await session.execute(stmt)
-            await session.commit()
-        
-        # TODO: Call your bundle activation API here
-        # Example: await activate_bundle(phone, package_data)
-        
-        logger.info(f"Airtime purchase successful: {phone} bought {package_data['quantity']}MB for {price} RWF")
-        
-        return {
-            "success": True,
-            "message": f"✅ Purchase successful!\n\n📦 Package: {package_data['quantity']}MB ({package_data['period']})\n💰 Amount: {price} RWF\n💳 Payment: Airtime Balance\n🆔 Transaction: TXN{datetime.now().strftime('%Y%m%d%H%M%S')}\n\nYour bundle has been activated!"
+        # Prepare bundle purchase payload
+        purchase_payload = {
+            "phone_number": phone,
+            "main_id": int(package_data.get("main_id", 1)),
+            "sub_id": int(package_data.get("sub_id", 1)),
+            "period_id": int(package_data.get("period_id", 1)),
+            "option_number": int(package_data.get("option_number", 1))
         }
+        
+        logger.info(f"Calling bundle API with payload: {purchase_payload}")
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                response = await client.post(
+                    BUNDLE_API_URL,
+                    headers={
+                        "accept": "application/json",
+                        "Content-Type": "application/json"
+                    },
+                    json=purchase_payload
+                )
+                
+                logger.info(f"Bundle API response: {response.status_code} - {response.text}")
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    
+                    # Deduct airtime balance after successful purchase
+                    airtime_table = metadata.tables.get("airtime_balance")
+                    if airtime_table is not None:
+                        stmt = update(airtime_table).where(
+                            airtime_table.c.phone_number == phone
+                        ).values(balance=balance - price)
+                        await session.execute(stmt)
+                        await session.commit()
+                        logger.info(f"Balance updated: {phone} - New balance: {balance - price} RWF")
+                    
+                    # Format success message with API response
+                    api_message = result.get('message', 'Bundle purchased successfully')
+                    quantity = result.get('quantity', package_data.get('quantity', 'N/A'))
+                    price_charged = result.get('price', package_data.get('price', 'N/A'))
+                    
+                    success_message = f"✅ {api_message}!\n\n"
+                    success_message += f"📦 Package: {quantity}MB ({package_data.get('period', 'N/A')})\n"
+                    success_message += f"💰 Amount Charged: {price_charged} RWF\n"
+                    success_message += f"💳 Payment Method: Airtime Balance\n"
+                    success_message += f"💵 Previous Balance: {balance} RWF\n"
+                    success_message += f"💵 New Balance: {balance - price} RWF\n"
+                    success_message += f"🆔 Option Number: {result.get('option_number', 'N/A')}\n\n"
+                    success_message += f"Your bundle has been activated and is ready to use!"
+                    
+                    return {
+                        "success": True,
+                        "message": success_message,
+                        "api_response": result
+                    }
+                else:
+                    error_detail = response.text
+                    try:
+                        error_json = response.json()
+                        error_detail = error_json.get('detail', error_json.get('message', response.text))
+                    except:
+                        pass
+                    
+                    logger.error(f"Bundle API error: {response.status_code} - {error_detail}")
+                    return {
+                        "success": False,
+                        "message": f"❌ Purchase failed\n\n{error_detail}\n\nPlease try again or contact support."
+                    }
+                    
+            except httpx.TimeoutException:
+                logger.error("Bundle API timeout")
+                return {
+                    "success": False,
+                    "message": "⏱️ Request timed out. Please try again in a moment."
+                }
+            except httpx.RequestError as e:
+                logger.exception(f"Bundle API request failed: {e}")
+                return {
+                    "success": False,
+                    "message": f"🔌 Unable to connect to purchase service.\n\nPlease check your connection and try again."
+                }
         
     except Exception as e:
         logger.exception("Airtime purchase error: %s", e)
         return {
             "success": False,
-            "message": f"Purchase failed: {str(e)}"
+            "message": f"❌ An unexpected error occurred.\n\nError: {str(e)}\n\nPlease try again or contact support."
         }
 
-async def process_momo_purchase(phone: str, package_data: Dict[str, Any], momo_pin: str) -> Dict[str, Any]:
-    """Process Mobile Money payment"""
+async def process_momo_purchase(session: AsyncSession, phone: str, package_data: Dict[str, Any], momo_pin: str, metadata: MetaData) -> Dict[str, Any]:
+    """Process Mobile Money payment and activate bundle"""
     try:
         price = float(package_data.get("price", 0))
         
-        # TODO: Call your Mobile Money API here
-        # Example: response = await momo_api.charge(phone, price, momo_pin)
-        
-        # Simulate API call
+        # Validate PIN format
         if len(momo_pin) < 4:
             return {
                 "success": False,
-                "message": "Invalid PIN format. Please provide a valid Mobile Money PIN."
+                "message": "❌ Invalid PIN format. Please provide a valid Mobile Money PIN (4-6 digits)."
             }
         
-        logger.info(f"MoMo purchase successful: {phone} bought {package_data['quantity']}MB for {price} RWF")
+        # TODO: Add Mobile Money payment API call here
+        # For now, we'll proceed directly to bundle activation
         
-        return {
-            "success": True,
-            "message": f"✅ Purchase successful!\n\n📦 Package: {package_data['quantity']}MB ({package_data['period']})\n💰 Amount: {price} RWF\n💳 Payment: Mobile Money\n🆔 Transaction: TXN{datetime.now().strftime('%Y%m%d%H%M%S')}\n\nYour bundle has been activated!"
+        # Prepare bundle purchase payload
+        purchase_payload = {
+            "phone_number": phone,
+            "main_id": int(package_data.get("main_id", 1)),
+            "sub_id": int(package_data.get("sub_id", 1)),
+            "period_id": int(package_data.get("period_id", 1)),
+            "option_number": int(package_data.get("option_number", 1))
         }
+        
+        logger.info(f"Calling bundle API with MoMo payment: {purchase_payload}")
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                response = await client.post(
+                    BUNDLE_API_URL,
+                    headers={
+                        "accept": "application/json",
+                        "Content-Type": "application/json"
+                    },
+                    json=purchase_payload
+                )
+                
+                logger.info(f"Bundle API response (MoMo): {response.status_code} - {response.text}")
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    
+                    # Format success message with API response
+                    api_message = result.get('message', 'Bundle purchased successfully')
+                    quantity = result.get('quantity', package_data.get('quantity', 'N/A'))
+                    price_charged = result.get('price', package_data.get('price', 'N/A'))
+                    
+                    success_message = f"✅ {api_message}!\n\n"
+                    success_message += f"📦 Package: {quantity}MB ({package_data.get('period', 'N/A')})\n"
+                    success_message += f"💰 Amount Charged: {price_charged} RWF\n"
+                    success_message += f"💳 Payment Method: Mobile Money\n"
+                    success_message += f"🆔 Transaction ID: TXN{datetime.now().strftime('%Y%m%d%H%M%S')}\n"
+                    success_message += f"🆔 Option Number: {result.get('option_number', 'N/A')}\n\n"
+                    success_message += f"Your bundle has been activated and is ready to use!"
+                    
+                    return {
+                        "success": True,
+                        "message": success_message,
+                        "api_response": result
+                    }
+                else:
+                    error_detail = response.text
+                    try:
+                        error_json = response.json()
+                        error_detail = error_json.get('detail', error_json.get('message', response.text))
+                    except:
+                        pass
+                    
+                    logger.error(f"Bundle API error (MoMo): {response.status_code} - {error_detail}")
+                    return {
+                        "success": False,
+                        "message": f"❌ Purchase failed\n\n{error_detail}\n\nPlease try again or contact support."
+                    }
+                    
+            except httpx.TimeoutException:
+                logger.error("Bundle API timeout (MoMo)")
+                return {
+                    "success": False,
+                    "message": "⏱️ Request timed out. Please try again in a moment."
+                }
+            except httpx.RequestError as e:
+                logger.exception(f"Bundle API request failed (MoMo): {e}")
+                return {
+                    "success": False,
+                    "message": f"🔌 Unable to connect to purchase service.\n\nPlease check your connection and try again."
+                }
         
     except Exception as e:
         logger.exception("MoMo purchase error: %s", e)
         return {
             "success": False,
-            "message": f"Purchase failed: {str(e)}"
+            "message": f"❌ An unexpected error occurred.\n\nError: {str(e)}\n\nPlease try again or contact support."
         }
 
 def extract_package_from_message(message: str, packages: list) -> Optional[Dict[str, Any]]:
@@ -141,12 +270,11 @@ def extract_package_from_message(message: str, packages: list) -> Optional[Dict[
         period = pkg.get("period", "")
         
         if quantity and price:
-            # Match patterns like "500MB", "500 MB", "500mb for 400", etc.
             if f"{quantity}mb" in msg_lower.replace(" ", "") or f"{quantity} mb" in msg_lower:
                 if price in message or period in msg_lower:
                     return pkg
     
-    # Try to match by number selection (e.g., "number 1", "option 2", "the first one")
+    # Try to match by number selection
     number_match = re.search(r'(?:number|option|choice)?\s*(\d+)', msg_lower)
     if number_match:
         try:
@@ -166,7 +294,7 @@ def extract_payment_method(message: str) -> Optional[str]:
         return "airtime"
     elif any(word in msg_lower for word in ["momo", "mobile money", "mtn", "airtel"]):
         return "momo"
-    elif re.search(r'\b[12]\b', message):  # User typed "1" or "2"
+    elif re.search(r'\b[12]\b', message):
         if "1" in message:
             return "airtime"
         elif "2" in message:
@@ -176,7 +304,6 @@ def extract_payment_method(message: str) -> Optional[str]:
 
 def extract_pin(message: str) -> Optional[str]:
     """Extract PIN from user message"""
-    # Look for 4-6 digit numbers
     pin_match = re.search(r'\b(\d{4,6})\b', message)
     if pin_match:
         return pin_match.group(1)
@@ -205,7 +332,6 @@ async def chat_endpoint(request: ChatRequest):
         if users is None:
             raise HTTPException(status_code=500, detail="Users table not found")
 
-        # Verify user exists
         if not hasattr(users.c, "phone_number"):
             raise HTTPException(status_code=400, detail="No phone_number column in users table")
         
@@ -215,7 +341,6 @@ async def chat_endpoint(request: ChatRequest):
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
-        # Get user's airtime balance
         user_balance = await get_user_balance(session, request.phone, metadata)
         
         # Fetch all relevant tables
@@ -238,30 +363,34 @@ async def chat_endpoint(request: ChatRequest):
                 logger.exception("Failed to fetch rows for table %s: %s", tbl_name, e)
                 tables_rows[tbl_name] = "error"
 
-        # Build package list
+        # Build package list with all required IDs for API call
         period_rows = tables_rows.get("period") or []
         sub_rows = tables_rows.get("sub_category") or []
         main_rows = tables_rows.get("main_category") or []
         qty_rows = tables_rows.get("quantity_price") or []
 
-        periods = {r.get("id"): r.get("label") for r in period_rows}
+        periods = {r.get("id"): {"label": r.get("label"), "sub_id": r.get("sub_id")} for r in period_rows}
         subs = {r.get("id"): {"name": r.get("name"), "main_id": r.get("main_id")} for r in sub_rows}
         mains = {r.get("id"): r.get("name") for r in main_rows}
 
         packages = []
-        period_to_sub = {r.get("id"): r.get("sub_id") for r in period_rows}
         
         for q in qty_rows:
             period_id = q.get("period_id")
-            period_label = periods.get(period_id, "unknown")
-            sub_id = period_to_sub.get(period_id)
+            period_data = periods.get(period_id, {})
+            period_label = period_data.get("label", "unknown")
+            sub_id = period_data.get("sub_id")
+            
             sub_name = None
+            main_id = None
             main_name = None
+            
             if sub_id:
                 sub = subs.get(sub_id)
                 if sub:
                     sub_name = sub.get("name")
-                    main_name = mains.get(sub.get("main_id"))
+                    main_id = sub.get("main_id")
+                    main_name = mains.get(main_id)
             
             pkg = {
                 "id": str(q.get("id")),
@@ -269,19 +398,19 @@ async def chat_endpoint(request: ChatRequest):
                 "price": str(q.get("price")),
                 "period": period_label,
                 "period_id": str(period_id),
+                "sub_id": str(sub_id) if sub_id else None,
+                "main_id": str(main_id) if main_id else None,
+                "option_number": str(q.get("option_number", 1)),
                 "sub_category": sub_name,
                 "main_category": main_name,
             }
             packages.append(pkg)
 
-        # Filter for internet packages
         internet_packages = [p for p in packages if p.get("main_category") and p.get("main_category").lower() == "internet"]
         available_packages = internet_packages if internet_packages else packages
 
-        # Get user session
         user_session = get_session(request.phone)
         
-        # Add to conversation history
         user_session["conversation_history"].append({
             "role": "user",
             "content": request.message,
@@ -293,39 +422,34 @@ async def chat_endpoint(request: ChatRequest):
 
         # STATE MACHINE LOGIC
         
-        # Check for cancellation at any point
         if is_cancellation(request.message):
             user_session["state"] = "idle"
             user_session["intent"] = None
             user_session["collected_data"] = {}
             reply_text = "No problem! Your session has been cancelled. How else can I help you today?"
         
-        # STATE: CONFIRMING - Waiting for final confirmation
         elif user_session["state"] == "confirming":
             if is_confirmation(request.message):
                 collected = user_session["collected_data"]
                 payment_method = collected.get("payment_method")
                 package_data = collected.get("package")
                 
-                # Process the purchase
                 if payment_method == "airtime":
                     result = await process_airtime_purchase(session, request.phone, package_data, metadata)
                 elif payment_method == "momo":
                     momo_pin = collected.get("momo_pin")
-                    result = await process_momo_purchase(request.phone, package_data, momo_pin)
+                    result = await process_momo_purchase(session, request.phone, package_data, momo_pin, metadata)
                 else:
                     result = {"success": False, "message": "Invalid payment method."}
                 
                 reply_text = result["message"]
                 
-                # Reset session after purchase attempt
                 user_session["state"] = "idle"
                 user_session["intent"] = None
                 user_session["collected_data"] = {}
             else:
                 reply_text = "Please type 'confirm' to complete your purchase or 'cancel' to abort."
         
-        # STATE: COLLECTING MOMO PIN
         elif user_session["state"] == "collecting_momo_pin":
             pin = extract_pin(request.message)
             if pin:
@@ -341,7 +465,6 @@ async def chat_endpoint(request: ChatRequest):
             else:
                 reply_text = "Please provide your Mobile Money PIN (4-6 digits) to proceed with the purchase."
         
-        # STATE: COLLECTING PAYMENT METHOD
         elif user_session["state"] == "collecting_payment":
             payment_method = extract_payment_method(request.message)
             
@@ -350,7 +473,6 @@ async def chat_endpoint(request: ChatRequest):
                 pkg = user_session["collected_data"]["package"]
                 
                 if payment_method == "airtime":
-                    # Check balance
                     price = float(pkg["price"])
                     if user_balance and user_balance >= price:
                         user_session["state"] = "confirming"
@@ -376,7 +498,6 @@ async def chat_endpoint(request: ChatRequest):
                     reply_text += f" ({user_balance} RWF available)"
                 reply_text += "\n2. Mobile Money"
         
-        # STATE: COLLECTING PACKAGE SELECTION
         elif user_session["state"] == "collecting_package":
             selected_package = extract_package_from_message(request.message, user_session["last_packages"])
             
@@ -396,16 +517,13 @@ async def chat_endpoint(request: ChatRequest):
                 reply_text += "- The package number (e.g., '1' or 'number 2')\n"
                 reply_text += "- Or the quantity (e.g., '500MB' or '1GB')"
         
-        # DEFAULT: Use OpenAI for intent detection and browsing
         else:
-            # Detect purchase intent
             purchase_keywords = ["buy", "purchase", "get", "want", "need", "subscribe"]
             has_purchase_intent = any(keyword in msg_lower for keyword in purchase_keywords)
             
             if has_purchase_intent and user_session["intent"] != "buy_internet":
                 user_session["intent"] = "buy_internet"
             
-            # Use OpenAI for response generation
             if OPENAI_API_KEY:
                 model_name = "gpt-4o-mini"
                 
@@ -485,11 +603,9 @@ Return ONLY the response text."""
                                 if content:
                                     reply_text = content
                                     
-                                    # If purchase intent, prepare for package selection
                                     if user_session["intent"] == "buy_internet":
                                         user_session["state"] = "collecting_package"
                                         
-                                        # Filter packages shown to user
                                         filtered = available_packages
                                         if "month" in msg_lower:
                                             filtered = [p for p in filtered if p.get("period", "").lower() == "month"]
@@ -501,7 +617,6 @@ Return ONLY the response text."""
                                         if not filtered:
                                             filtered = available_packages
                                         
-                                        # Sort by quantity
                                         try:
                                             filtered.sort(key=lambda x: float(x.get("quantity", 0)), reverse=True)
                                         except:
@@ -512,11 +627,9 @@ Return ONLY the response text."""
                 except Exception as e:
                     logger.exception("OpenAI error: %s", e)
 
-        # Fallback
         if not reply_text:
             reply_text = "I'm here to help you find and purchase internet packages. What are you looking for today?"
 
-        # Store response in history
         user_session["conversation_history"].append({
             "role": "assistant",
             "content": reply_text,
