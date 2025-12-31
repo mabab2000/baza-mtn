@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -25,6 +26,15 @@ engine = create_async_engine(DATABASE_URL.replace('postgresql://', 'postgresql+a
 async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 app = FastAPI()
+
+# Enable CORS for all origins (suitable for testing; restrict in production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # In-memory session storage (use Redis in production)
 chat_sessions: Dict[str, Dict[str, Any]] = {}
@@ -637,3 +647,9 @@ Return ONLY the response text."""
         })
 
         return {"reply": reply_text}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
