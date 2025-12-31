@@ -20,7 +20,7 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-BUNDLE_API_URL = os.getenv("BUNDLE_API_URL", "http://192.168.1.73:3000/bundles/purchase")
+BUNDLE_API_URL = os.getenv("BUNDLE_API_URL", "https://node-js-o2ot.onrender.com/bundles/purchase")
 
 engine = create_async_engine(DATABASE_URL.replace('postgresql://', 'postgresql+asyncpg://'), echo=True)
 async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
